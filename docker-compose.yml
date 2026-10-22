@@ -1,0 +1,180 @@
+# ==============================================================================
+# ORKESTRASI DOCKER COMPOSE: MODUL CRUD-DOCKER
+# ==============================================================================
+# INI APA: Master Conductor yang menyatukan, membangun (build), menghubungkan jaringan,
+#          dan mengatur volume penyimpanan persisten untuk seluruh monorepo.
+# KENAPA: Berada di folder 'crud-docker/' agar repositori terstruktur rapi ke dalam 3 fokus:
+#         1. crud-fe (Frontend Nuxt 4)
+#         2. crud-be (Backend Laravel 12)
+#         3. crud-docker (Orkestrasi Fullstack & Ingress Gateway)
+# UNTUK APA & BAGAIMANA:
+#   - Mereferensikan kode sumber backend via relative path '../crud-be'
+#   - Mereferensikan kode sumber frontend via relative path '../crud-fe'
+#   - Menyediakan Ingress Nginx port 80 dan MySQL 8.0 port eksternal 3307
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. SERVICE DATABASE (MySQL 8.0 Community Server)
+  # ----------------------------------------------------------------------------
+  # INI APA: Kontainer yang menjalankan server basis data relasional MySQL 8.0.
+  # KENAPA: Menggunakan image resmi Docker Hub agar versi MySQL stabil, terisolasi,
+  #         dan tidak mengotori sistem operasi host dengan instalasi server fisik.
+  # UNTUK APA & BAGAIMANA: Menampung data tabel 'users', 'products', 'personal_access_tokens'.
+  # ----------------------------------------------------------------------------
+  database:
+    image: mysql:8.0
+    container_name: crud-database
+    restart: unless-stopped # Otomatis hidup kembali jika crash atau server restart
+
+    environment:
+      # Variabel environment yang dibaca dari file .env di dalam crud-docker/:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}           # Password akun superuser 'root'
+      MYSQL_DATABASE: ${DB_DATABASE:-db_project_mono_repo_crud} # Database utama yang otomatis dibuat saat pertama kali boot
+      MYSQL_USER: ${DB_USERNAME:-crud_user}                    # User tambahan non-root untuk operasional harian
+      MYSQL_PASSWORD: ${DB_PASSWORD:-crud_password}            # Password untuk user tambahan tersebut
+
+    ports:
+      # INI APA: Pemetaan port dari [Host OS] : [Kontainer Docker Internal]
+      # KENAPA: Menggunakan port 3307 di host agar TIDAK BENTROK dengan MySQL lokal Windows di port 3306.
+      # BAGAIMANA: Memungkinkan aplikasi GUI seperti DBeaver/HeidiSQL di Windows mengakses DB via localhost:3307.
+      - "${DB_EXTERNAL_PORT:-3307}:3306"
+
+    volumes:
+      # INI APA: Docker Named Volume.
+      # KENAPA: Kontainer bersifat sementara (ephemeral). Jika kontainer dimatikan/dihapus, data TIDAK AKAN HILANG.
+      # BAGAIMANA: Docker memetakan folder internal '/var/lib/mysql' ke storage virtual disk 'crud_db_data'.
+      - db_data:/var/lib/mysql
+
+    networks:
+      - crud-network
+
+    healthcheck:
+      # INI APA: Pengecekan kesiapan database secara periodik.
+      # KENAPA: MySQL butuh 5-10 detik untuk inisialisasi socket pertama kali.
+      # BAGAIMANA: Menjalankan 'mysqladmin ping'. Kontainer Backend akan MENUNGGU sampai status ini 'healthy'
+      #           sebelum mulai menjalankan migrasi tabel agar tidak terjadi error connection refused.
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # 2. SERVICE BACKEND REST API (Laravel 12 / PHP 8.2-FPM Alpine)
+  # ----------------------------------------------------------------------------
+  # INI APA: Kontainer aplikasi backend berbasis PHP-FPM (FastCGI Process Manager).
+  # KENAPA: PHP-FPM adalah standar performa tinggi industri produksi. Tidak memakai 'artisan serve'
+  #         karena 'artisan serve' adalah server single-thread eksperimen yang tidak aman untuk traffic riil.
+  # UNTUK APA & BAGAIMANA: Memproses logika bisnis, hashing auth, routing API, dan query ke MySQL.
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: ../crud-be    # Mengarahkan konteks build ke folder saudara '../crud-be'
+      dockerfile: Dockerfile # Merujuk ke resep Dockerfile multi-stage di dalam crud-be
+    container_name: crud-backend
+    restart: unless-stopped
+
+    environment:
+      APP_NAME: "Laravel CRUD"
+      APP_ENV: production
+      APP_DEBUG: "false"      # Dinonaktifkan di production agar detail error sensitif tidak bocor ke publik
+      APP_URL: "http://localhost"
+      APP_KEY: ${APP_KEY:-base64:HRsXCwVn4TBICEWsZb4eBpB05BTiCaNhq/T0H6Il7wQ=}
+      DB_CONNECTION: mysql
+      DB_HOST: database       # DNS internal Docker! Mengarah langsung ke service 'database' di atas
+      DB_PORT: 3306           # Port internal MySQL di dalam jaringan Docker
+      DB_DATABASE: ${DB_DATABASE:-db_project_mono_repo_crud}
+      DB_USERNAME: ${DB_USERNAME:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      CORS_ALLOWED_ORIGINS: "http://localhost,http://127.0.0.1,http://localhost:3000"
+
+    volumes:
+      # INI APA: Penyimpanan persisten folder storage Laravel (file upload, log, cache session).
+      # KENAPA: Mencegah file upload pengguna terhapus saat image backend di-rebuild.
+      - be_storage:/var/www/html/storage
+
+    depends_on:
+      # INI APA: Penjadwalan dependensi urutan booting.
+      # BAGAIMANA: Backend DITAHAN untuk start sampai database MySQL benar-benar berstatus 'healthy'.
+      database:
+        condition: service_healthy
+
+    networks:
+      - crud-network
+
+  # ----------------------------------------------------------------------------
+  # 3. SERVICE FRONTEND WEB APP (Nuxt 4 / Node 22 Nitro Server)
+  # ----------------------------------------------------------------------------
+  # INI APA: Kontainer antarmuka Single Page Application & SSR berbasis Vue 3 + Nuxt 4.
+  # KENAPA: Menggunakan output server standalone Nitro (kompilasi final '.output/server/index.mjs').
+  #         Sangat hemat RAM (~27 MB) karena seluruh devDependencies/Vite compiler telah dibuang.
+  # UNTUK APA & BAGAIMANA: Merender halaman web, mengelola interaksi visual, dan memanggil endpoint API.
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ../crud-fe    # Mengarahkan konteks build ke folder saudara '../crud-fe'
+      dockerfile: Dockerfile # Merujuk ke resep Dockerfile multi-stage di dalam crud-fe
+      args:
+        # Menetapkan base URL pemanggilan API saat build time ke relative path '/api'
+        NUXT_PUBLIC_API_BASE: /api
+    container_name: crud-frontend
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+      NUXT_PUBLIC_API_BASE: /api # Memastikan runtime Nuxt menggunakan relative path /api via Ingress Nginx
+
+    networks:
+      - crud-network
+
+  # ----------------------------------------------------------------------------
+  # 4. SERVICE INGRESS GATEWAY (Nginx Alpine Reverse Proxy)
+  # ----------------------------------------------------------------------------
+  # INI APA: Satu-satunya pintu gerbang publik yang menghubungkan dunia luar dengan kontainer privat.
+  # KENAPA: Menggunakan Nginx di port 80 menghilangkan 100% masalah CORS dan isolasi cookie Sanctum,
+  #         karena browser menganggap Frontend dan Backend berada di bawah domain yang sama (Same-Origin).
+  # UNTUK APA & BAGAIMANA:
+  #   - Jika user meminta '/api/*', Nginx meneruskannya ke backend (FastCGI PHP-FPM:9000).
+  #   - Jika user meminta '/*', Nginx meneruskannya ke frontend (Nitro Node:3000).
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: crud-nginx
+    restart: unless-stopped
+
+    ports:
+      # Port 80 host Windows/Server dipetakan ke port 80 Nginx kontainer
+      - "${APP_PORT:-80}:80"
+
+    volumes:
+      # Memasang konfigurasi routing kustom kita dari subfolder './nginx/'
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # Memasang folder public Laravel agar Nginx bisa melayani file statis dan index.php
+      - ../crud-be/public:/var/www/html/public:ro
+
+    depends_on:
+      - backend
+      - frontend
+
+    networks:
+      - crud-network
+
+# ------------------------------------------------------------------------------
+# DEFINISI PENYIMPANAN PERSISTEN (DOCKER VOLUMES)
+# ------------------------------------------------------------------------------
+# Volume ini di-manage oleh Docker dan tidak akan terhapus saat kontainer dihentikan (docker compose down).
+volumes:
+  db_data:
+    name: crud_db_data     # Volume persisten file biner database MySQL
+  be_storage:
+    name: crud_be_storage  # Volume persisten berkas storage/logs/uploads Laravel
+
+# ------------------------------------------------------------------------------
+# DEFINISI JARINGAN ISOLASI (DOCKER BRIDGE NETWORK)
+# ------------------------------------------------------------------------------
+# Jaringan privat internal: kontainer di dalam jaringan ini bisa saling memanggil
+# menggunakan nama service mereka sebagai hostname DNS (misal: 'database:3306', 'backend:9000').
+networks:
+  crud-network:
+    name: crud_network
+    driver: bridge
