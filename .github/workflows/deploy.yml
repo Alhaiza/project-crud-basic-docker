@@ -1,0 +1,37 @@
+name: Auto Deploy Orchestration (Docker & Ingress)
+
+on:
+  push:
+    branches:
+      - main
+
+# Batasi hanya 1 proses deploy yang berjalan bersamaan (mencegah tabrakan build)
+concurrency:
+  group: deploy-docker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to VPS Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Eksekusi Deployment via SSH ke VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "==> [CI/CD] Menarik konfigurasi orkestrasi terbaru..."
+            cd /var/www/app-crud/crud-docker
+            git pull origin main
+
+            echo "==> [CI/CD] Me-refresh seluruh cluster kontainer & Nginx ingress..."
+            docker compose up -d --build
+
+            echo "==> [CI/CD] Pembersihan image lama (disk housekeeping)..."
+            docker image prune -f
+
+            echo "==> [CI/CD] Stack orkestrasi berhasil di-deploy!"

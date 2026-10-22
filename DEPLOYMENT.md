@@ -269,3 +269,49 @@ docker compose up -d --build --no-deps backend
 | **Clear Cache Laravel** | `docker compose exec backend php artisan optimize:clear` |
 | **Backup Database MySQL** | `docker compose exec database mysqldump -u root -p${DB_ROOT_PASSWORD} db_project_mono_repo_crud > backup_$(date +%Y%m%d).sql` |
 | **Restart Nginx Gateway** | `docker compose restart nginx` |
+
+---
+
+## BAGIAN 3: Otomasi CI/CD Auto-Deploy saat Merge ke `main` (GitHub Actions)
+
+Dengan alur ini, Anda **tidak perlu lagi login SSH manual** setiap kali merilis fitur baru. Cukup lakukan merge Pull Request ke branch `main` di GitHub, maka GitHub Actions akan secara otomatis menghubungkan diri ke server VPS via SSH, melakukan `git pull`, dan me-rebuild kontainer yang bersangkutan dalam hitungan detik.
+
+### 1. Konfigurasi 1 Kali di GitHub Secrets
+
+Agar GitHub Actions memiliki izin untuk melakukan SSH ke VPS Anda, tambahkan 4 kunci rahasia (*Secrets*) pada masing-masing repositori GitHub (`crud-be`, `crud-fe`, dan `crud-docker`):
+
+1. Buka repositori Anda di GitHub.
+2. Klik tab **Settings** -> pilih menu **Secrets and variables** -> klik **Actions**.
+3. Klik tombol **New repository secret** dan masukkan:
+
+| Nama Secret | Nilai yang Harus Diisi |
+| :--- | :--- |
+| `SSH_HOST` | Alamat IP Publik VPS Anda (contoh: `103.123.45.67`) |
+| `SSH_USER` | Akun pengguna SSH VPS Anda (biasanya `root`) |
+| `SSH_KEY` | Kunci Privat SSH (`id_rsa` atau `id_ed25519`) dari komputer Anda yang sudah terdaftar di `~/.ssh/authorized_keys` VPS Anda |
+| `SSH_PORT` | Port SSH VPS Anda (default: `22`) |
+
+*(Tips: Jika Anda ingin ketiga repo menggunakan secret yang sama secara otomatis, Anda dapat menyimpannya di level **Organization Secrets**).*
+
+### 2. Alur Kerja Rilis Harian (Workflow)
+
+Setelah GitHub Secrets terkonfigurasi, alur rilis Anda menjadi sangat sederhana:
+
+```mermaid
+flowchart LR
+    Dev["Developer\n(Coding di branch develop)"] -->|1. Git Push| GH["GitHub Repository\n(Pull Request develop -> main)"]
+    GH -->|2. Klik 'Merge Pull Request'| GHA["GitHub Actions Runner\n(Triggers deploy.yml)"]
+    GHA -->|3. SSH Remote Command| Server["Server VPS Produksi\n(git pull & docker compose up)"]
+    Server -->|4. Live Instant| User["Klien / Pengguna Web\n(Aplikasi Terupdate Otomatis)"]
+```
+
+1. **Pengembangan Fitur:** Kerjakan fitur baru di branch `develop` pada repositori yang bersangkutan (misal `crud-fe`).
+2. **Push ke GitHub:** Lakukan `git push origin develop`.
+3. **Buka Pull Request:** Di GitHub, buat Pull Request dari branch `develop` ke branch `main`.
+4. **Merge Pull Request:** Review kode Anda, lalu klik tombol **"Merge pull request"**.
+5. **Auto-Deploy Berjalan:**
+   - GitHub Actions mendeteksi ada push/merge baru ke `main`.
+   - Workflow `.github/workflows/deploy.yml` otomatis aktif.
+   - GitHub melakukan SSH ke VPS, menarik kode terbaru, dan me-rebuild kontainer terkait (`--no-deps`).
+   - Anda dapat memantau statusnya di tab **Actions** pada halaman GitHub repositori.
+6. **Selesai:** Website langsung terupdate secara otomatis dalam ~30 detik tanpa downtime!
