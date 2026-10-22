@@ -1,210 +1,271 @@
-# Panduan Komprehensif Deployment & DevOps: crud-docker
+# Panduan Operasional Deployment: Fullstack Monorepo
 
-Dokumen ini menjelaskan secara mendalam bagaimana modul orkestrasi **crud-docker** bekerja untuk mengintegrasikan **crud-fe** (Nuxt 4), **crud-be** (Laravel 12), dan basis data MySQL 8.0, serta panduan praktis untuk deployment di komputer lokal maupun server produksi Linux/VPS.
+Dokumentasi resmi alur kerja deployment untuk sistem monorepo terpadu (**crud-fe**, **crud-be**, dan **crud-docker**). Dokumen ini disusun secara praktis ke dalam 2 bagian utama:
 
----
-
-## 1. Arsitektur & Cara Kerja Deployment
-
-Modul `crud-docker` mengadopsi pola arsitektur **Unified Ingress Gateway Pattern** menggunakan **Docker Compose** dan **Nginx Reverse Proxy**.
-
-### Diagram Arsitektur & Topologi Jaringan
-
-```mermaid
-flowchart TD
-    User["Peramban Klien / Publik\n(http://domain.com atau http://localhost)"] -->|Port 80 / 443| Ingress["Nginx Ingress Reverse Proxy\n(crud-nginx:80)"]
-
-    subgraph Docker Network: crud-network [Jaringan Privat Terisolasi: crud-network]
-        Ingress -->|1. URI /api/*\nvia FastCGI:9000| Backend["Backend API: Laravel 12\n(PHP 8.2-FPM Alpine)"]
-        Ingress -->|2. URI /* (Non-API)\nvia HTTP Proxy:3000| Frontend["Frontend UI: Nuxt 4\n(Standalone Nitro Node 22)"]
-        Backend -->|3. Query SQL PDO\nPort 3306| Database[("Database: MySQL 8.0\nVolume: crud_db_data")]
-    end
-
-    Dev["Aplikasi GUI Host (DBeaver / DataGrip)"] -.->|Port 3307 External| Database
-```
-
-### 5 Tahapan Siklus Hidup (Lifecycle) Deployment
-
-1. **Perakitan Multi-Stage Build:**
-   - **Frontend Nuxt 4 (`../crud-fe/Dockerfile`):** Stage builder mengompilasi Vite dan menghasilkan folder `.output`. Seluruh `node_modules` dibuang di stage runner, menghasilkan kontainer ringan (~27 MiB RAM).
-   - **Backend Laravel 12 (`../crud-be/Dockerfile`):** Stage vendor Composer mengunduh paket produksi (`--no-dev`), lalu disalin ke runtime PHP 8.2-FPM Alpine dengan OPcache aktif (~32 MiB RAM).
-
-2. **Orkestrasi Booting & Healthcheck (`docker-compose.yml`):**
-   - MySQL boot terlebih dahulu dan dipantau via `mysqladmin ping`.
-   - Backend ditahan sampai MySQL `healthy`, lalu skrip `entrypoint.sh` menjalankan TCP socket probe (`nc -z`), auto-generate `APP_KEY`, pembersihan residu cache Windows, optimasi rute, dan migrasi tabel (`php artisan migrate --force`).
-   - Frontend dan Nginx Ingress aktif setelah backend siap.
-
-3. **Jaringan Internal Terisolasi (`crud-network`):**
-   - Seluruh kontainer berkomunikasi lewat DNS internal (`database:3306`, `backend:9000`, `frontend:3000`).
-   - Port backend dan frontend tidak diekspos ke publik (aman dari port scan).
-
-4. **Routing Satu Pintu & Zero CORS (Nginx Ingress):**
-   - Port 80 Nginx membedah URI: prefix `/api/*` dialihkan ke FastCGI PHP-FPM, sedangkan rute lainnya `/*` dialihkan ke server Nitro Nuxt 4.
-   - Karena berjalan di satu origin yang sama, browser tidak mengalami masalah CORS dan cookie Sanctum aman.
-
-5. **Persistensi Data (Docker Volumes):**
-   - `crud_db_data`: Menjaga database MySQL tetap aman saat kontainer dimatikan/di-rebuild.
-   - `crud_be_storage`: Menjaga file upload, log, dan sesi Laravel tetap utuh.
+1. **Bagian 1: Persiapan Awal (Fresh Server Setup)** — Dari server Linux polosan hingga aplikasi live.
+2. **Bagian 2: Alur Pembaruan Kode (Day-2 Operations / Code Updates)** — Cara memperbarui aplikasi saat ada perubahan fitur di Frontend atau Backend tanpa merusak database.
 
 ---
 
-## 2. Pemetaan Berkas di Dalam `crud-docker/`
+## BAGIAN 1: Persiapan Awal (Fresh Server Setup)
 
-| Berkas | Peran Utama | Alasan & Cara Kerjanya |
-| :--- | :--- | :--- |
-| **`docker-compose.yml`** | Master Conductor | Mengorkestrasikan 4 layanan dengan referensi build context `../crud-be` dan `../crud-fe`. |
-| **`nginx/default.conf`** | Ingress Router | Menyatukan port publik ke port 80, memisahkan lalu lintas `/api/*` (FastCGI) dan `/*` (Nuxt Nitro). |
-| **`.env.example`** | Template Kredensial | Berkas contoh konfigurasi lingkungan untuk port publik, kredensial database, dan encryption key. |
-| **`.env`** | Konfigurasi Aktif | Variabel lingkungan yang aktif dibaca oleh `docker-compose.yml`. |
-| **`project-context.md`** | Context Memory | Dokumentasi internal untuk AI Agent & DevOps engineer. |
+Bagian ini dijalankan **hanya sekali** ketika Anda baru pertama kali menyewa server Linux / VPS (Ubuntu 22.04 / 24.04 LTS).
 
----
+### Langkah 1: Masuk ke Server via SSH
 
-## 3. Panduan Deploy di Komputer Lokal (Pengujian)
-
-### Langkah 1: Masuk ke Folder `crud-docker`
+Buka terminal di komputer lokal Anda (PowerShell, Git Bash, atau Terminal macOS/Linux):
 
 ```bash
-cd crud-docker
+ssh root@IP_SERVER_ANDA
 ```
 
-### Langkah 2: Siapkan File `.env`
+*(Ketik `yes` jika muncul konfirmasi host key, lalu masukkan kata sandi VPS Anda).*
+
+### Langkah 2: Perbarui Sistem Operasi & Pasang Firewall
+
+Jalankan perintah ini untuk memperbarui paket sistem dan mengunci port yang tidak terpakai:
 
 ```bash
-cp .env.example .env
+# 1. Perbarui daftar paket dan upgrade sistem operasi
+apt update && apt upgrade -y
+
+# 2. Pasang paket dasar yang dibutuhkan
+apt install -y curl git ufw htop
+
+# 3. Kunci firewall server (Hanya izinkan SSH, HTTP, dan HTTPS)
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
 ```
 
-*(Nilai default sudah diatur untuk port HTTP 80 dan port MySQL eksternal 3307).*
+### Langkah 3: Pasang Docker Engine & Docker Compose Resmi
 
-### Langkah 3: Build & Nyalakan Cluster
-
-```bash
-docker compose up -d --build
-```
-
-### Langkah 4: Verifikasi Status Kontainer
+Gunakan installer resmi dari Docker Hub agar kompatibel dengan arsitektur Alpine & Node 22:
 
 ```bash
-docker compose ps
-```
-
-Pastikan keempat kontainer berstatus `Up` (dan database `healthy`):
-
-- `crud-database` (port 3307 -> 3306)
-- `crud-backend` (port 9000 internal)
-- `crud-frontend` (port 3000 internal)
-- `crud-nginx` (port 80 publik)
-
-### Langkah 5: Akses Aplikasi
-
-- **Aplikasi Web Frontend:** [http://localhost/](http://localhost/)
-- **REST API Backend:** [http://localhost/api/products](http://localhost/api/products)
-- **GUI Database (DBeaver):** Host `localhost`, Port `3307`, User `root`, Password `root`.
-
-### Menghentikan Cluster
-
-```bash
-docker compose down
-```
-
----
-
-## 4. Panduan Deploy ke Server Linux / VPS Produksi
-
-### Langkah 1: Hubungkan ke VPS & Pasang Docker
-
-```bash
-ssh root@ip_server_anda
-
-# Update paket sistem
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl git ufw
-
-# Pasang Docker resmi
+# 1. Unduh dan jalankan installer resmi
 curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo apt install -y docker-compose-plugin
+sh get-docker.sh
 
-# Konfigurasi firewall
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw --force enable
+# 2. Pastikan Docker dan Docker Compose berhasil terpasang
+docker --version
+docker compose version
 ```
 
-### Langkah 2: Clone Repositori Monorepo
+### Langkah 4: Siapkan Folder Proyek & Clone Repositori
+
+Buat folder kerja di `/var/www/app-crud` dan clone ketiga repositori secara sejajar:
 
 ```bash
-git clone https://github.com/username/mono-repo-crud-basic.git /var/www/app-crud
+# 1. Buat folder induk aplikasi
+mkdir -p /var/www/app-crud
+cd /var/www/app-crud
+
+# 2. Clone masing-masing repositori
+git clone https://github.com/username/crud-be.git crud-be
+git clone https://github.com/username/crud-fe.git crud-fe
+git clone https://github.com/username/crud-docker.git crud-docker
+
+# 3. Verifikasi struktur folder (Wajib sejajar seperti di bawah)
+ls -la
+```
+
+Struktur direktori di server wajib seperti berikut:
+
+```text
+/var/www/app-crud/
+├── crud-be/         # Kode Backend Laravel 12
+├── crud-fe/         # Kode Frontend Nuxt 4
+└── crud-docker/     # Konfigurasi Docker Compose & Ingress
+```
+
+### Langkah 5: Konfigurasi Environment Produksi (`.env`)
+
+```bash
+# 1. Pindah ke direktori orkestrasi
 cd /var/www/app-crud/crud-docker
-```
 
-### Langkah 3: Konfigurasi Kredensial Produksi (`.env`)
-
-```bash
+# 2. Salin template environment
 cp .env.example .env
+
+# 3. Buka dan edit file .env
 nano .env
 ```
 
-*Ganti `DB_ROOT_PASSWORD` dan `DB_PASSWORD` dengan kombinasi karakter acak yang kuat.*
+Sesuaikan nilai untuk keamanan server produksi:
 
-### Langkah 4: Bangun & Jalankan Kontainer
+```env
+APP_PORT=80
+DB_EXTERNAL_PORT=3307
+DB_ROOT_PASSWORD=GantiPasswordRootKuatAcak123!
+DB_DATABASE=db_project_mono_repo_crud
+DB_USERNAME=root
+DB_PASSWORD=GantiPasswordRootKuatAcak123!
+APP_KEY=base64:HRsXCwVn4TBICEWsZb4eBpB05BTiCaNhq/T0H6Il7wQ=
+```
+
+*(Tekan `Ctrl + O`, lalu `Enter` untuk menyimpan, lalu `Ctrl + X` untuk keluar dari nano).*
+
+### Langkah 6: Build Pertama Kali & Menjalankan Aplikasi
+
+Jalankan perintah ini untuk membangun seluruh image kontainer:
 
 ```bash
+# Bangun dan jalankan seluruh service di latar belakang
 docker compose up -d --build
-docker compose ps
+```
+
+Pantau log inisialisasi backend dan migrasi database otomatis:
+
+```bash
 docker compose logs -f backend
 ```
 
-### Langkah 5: Konfigurasi HTTPS / SSL Otomatis via Certbot
+*(Jika log menampilkan `Koneksi basis data MySQL terhubung!` dan `Running migrations`, tekan `Ctrl + C` untuk keluar dari log).*
 
-1. Arahkan domain (misal `app.domainanda.com`) ke IP server.
+Periksa status seluruh kontainer:
 
-2. Pasang Certbot:
+```bash
+docker compose ps
+```
 
-   ```bash
-   sudo apt install -y certbot
-   ```
+*Pastikan:* `crud-database` berstatus `healthy`, serta `crud-backend`, `crud-frontend`, dan `crud-nginx` berstatus `Up`. Aplikasi Anda sekarang sudah live di `http://IP_SERVER_ANDA/`!
 
-3. Hentikan Nginx sejenak:
+### Langkah 7: Menghubungkan Domain & SSL Gratis (HTTPS / Let's Encrypt)
 
-   ```bash
-   docker compose stop nginx
-   ```
+Jika Anda memiliki domain (misal: `app.domainanda.com` yang sudah diarahkan DNS A Record-nya ke IP VPS):
 
-4. Generate sertifikat:
+```bash
+# 1. Pasang certbot di server host
+apt install -y certbot
 
-   ```bash
-   sudo certbot certonly --standalone -d app.domainanda.com
-   ```
+# 2. Hentikan kontainer Nginx sementara
+docker compose stop nginx
 
-5. Buka `docker-compose.yml`, ekspos port 443 dan mount volume sertifikat `/etc/letsencrypt:/etc/letsencrypt:ro`.
+# 3. Dapatkan sertifikat SSL otomatis
+certbot certonly --standalone -d app.domainanda.com
 
-6. Tambahkan blok SSL di `nginx/default.conf` lalu hidupkan kembali:
-
-   ```bash
-   docker compose up -d nginx
-   ```
+# 4. Pasang volume sertifikat di docker-compose.yml dan hidupkan kembali
+docker compose start nginx
+```
 
 ---
 
-## 5. Runbook Pemeliharaan & Troubleshooting
+## BAGIAN 2: Alur Pembaruan Kode (Day-2 Operations / Code Updates)
+
+Bagian ini dijalankan **setiap kali Anda merilis fitur baru** ke GitHub. Anda **tidak perlu mengulang** instalasi server atau mereset database.
+
+### Skenario A: Hanya Frontend (`crud-fe`) yang Ada Update Baru
+
+Jika Anda hanya mengubah tampilan, komponen Vue, CSS, atau layout di Frontend:
 
 ```bash
-# Masuk ke direktori crud-docker
-cd crud-docker
+# 1. Masuk ke folder frontend dan tarik kode terbaru
+cd /var/www/app-crud/crud-fe
+git pull origin develop
 
-# Memperbarui aplikasi setelah ada git push baru di server
-git pull origin main
-docker compose up -d --build
+# 2. Pindah ke folder orkestrasi
+cd ../crud-docker
 
-# Menjalankan artisan di kontainer backend
-docker compose exec backend php artisan db:seed
-docker compose exec backend php artisan optimize:clear
-
-# Backup database ke file SQL
-docker compose exec database mysqldump -u root -p${DB_ROOT_PASSWORD} db_project_mono_repo_crud > backup_$(date +%Y%m%d).sql
-
-# Monitor penggunaan RAM
-docker stats --no-stream
+# 3. Rebuild HANYA kontainer frontend tanpa mematikan database atau backend
+docker compose up -d --build --no-deps frontend
 ```
+
+*Keuntungan:* Database MySQL dan Backend Laravel tidak mati sama sekali (Zero Downtime API).
+
+---
+
+### Skenario B: Hanya Backend (`crud-be`) yang Ada Update Logika / Bugfix
+
+Jika Anda menambah controller, service, atau memperbaiki algoritma tanpa perubahan skema tabel database:
+
+```bash
+# 1. Masuk ke folder backend dan tarik kode terbaru
+cd /var/www/app-crud/crud-be
+git pull origin develop
+
+# 2. Pindah ke folder orkestrasi
+cd ../crud-docker
+
+# 3. Rebuild HANYA kontainer backend
+docker compose up -d --build --no-deps backend
+```
+
+*Catatan:* Skrip `entrypoint.sh` otomatis membersihkan cache lama dan menyegarkan route cache di produksi.
+
+---
+
+### Skenario C: Backend Ada Migrasi Tabel Baru (`create_table` / `add_column`)
+
+Jika update backend menyertakan berkas migration Laravel baru:
+
+```bash
+# 1. Masuk ke folder backend dan tarik kode terbaru
+cd /var/www/app-crud/crud-be
+git pull origin develop
+
+# 2. Pindah ke folder orkestrasi dan rebuild backend
+cd ../crud-docker
+docker compose up -d --build --no-deps backend
+
+# 3. Skrip entrypoint otomatis menjalankan 'php artisan migrate --force'.
+#    Jika ingin memverifikasi status migrasi secara manual:
+docker compose exec backend php artisan migrate:status
+```
+
+*Penting:* Data yang sudah ada di database **tetap utuh dan aman** karena tabel disimpan di dalam Docker Named Volume `crud_db_data`.
+
+---
+
+### Skenario D: Frontend dan Backend Keduanya Memiliki Update Sekaligus
+
+Jika ada rilis besar (fullstack feature) di mana kedua modul berubah bersamaan:
+
+```bash
+# 1. Tarik kode terbaru di folder frontend
+cd /var/www/app-crud/crud-fe
+git pull origin develop
+
+# 2. Tarik kode terbaru di folder backend
+cd /var/www/app-crud/crud-be
+git pull origin develop
+
+# 3. Pindah ke folder orkestrasi dan rebuild seluruh aplikasi
+cd ../crud-docker
+docker compose up -d --build
+```
+
+---
+
+### Skenario E: Rollback Cepat (Jika Kode Baru Bermasalah / Error)
+
+Jika update kode terbaru di server mengalami bug kritis dan Anda ingin kembali ke versi sebelumnya secara instan:
+
+```bash
+# 1. Masuk ke repositori modul yang ingin di-rollback (misal crud-be)
+cd /var/www/app-crud/crud-be
+
+# 2. Kembalikan ke commit hash yang stabil
+git checkout <COMMIT_HASH_SEBELUMNYA>
+
+# 3. Pindah ke crud-docker dan rebuild kontainer tersebut
+cd ../crud-docker
+docker compose up -d --build --no-deps backend
+```
+
+---
+
+## Ringkasan Perintah Cepat Pemeliharaan (Cheat Sheet)
+
+| Kebutuhan Operasional | Perintah (Dijalankan dari `crud-docker/`) |
+| :--- | :--- |
+| **Lihat Status Kontainer** | `docker compose ps` |
+| **Pantau Log Semua Service** | `docker compose logs -f` |
+| **Pantau Log Khusus API** | `docker compose logs -f backend` |
+| **Pantau Log Akses Nginx** | `docker compose logs -f nginx` |
+| **Periksa Penggunaan RAM** | `docker stats --no-stream` |
+| **Masuk ke Terminal Backend** | `docker compose exec backend sh` |
+| **Clear Cache Laravel** | `docker compose exec backend php artisan optimize:clear` |
+| **Backup Database MySQL** | `docker compose exec database mysqldump -u root -p${DB_ROOT_PASSWORD} db_project_mono_repo_crud > backup_$(date +%Y%m%d).sql` |
+| **Restart Nginx Gateway** | `docker compose restart nginx` |
