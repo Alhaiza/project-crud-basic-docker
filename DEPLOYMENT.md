@@ -63,9 +63,9 @@ mkdir -p /var/www/app-crud
 cd /var/www/app-crud
 
 # 2. Clone masing-masing repositori
-git clone https://github.com/username/crud-be.git crud-be
-git clone https://github.com/username/crud-fe.git crud-fe
-git clone https://github.com/username/crud-docker.git crud-docker
+git clone git@github-personal:Alhaiza/project-crud-basic-be.git crud-be
+git clone git@github-personal:Alhaiza/project-crud-basic-fe.git crud-fe
+git clone git@github-personal:Alhaiza/project-crud-basic-docker.git crud-docker
 
 # 3. Verifikasi struktur folder (Wajib sejajar seperti di bawah)
 ls -la
